@@ -1,0 +1,161 @@
+---
+jobs:
+- instances: 1
+  name: scraper
+  persistent_disk_pool: disks
+  networks:
+  - name: scraper
+  resource_pool: scraper
+  templates:
+  - name: postgres
+    properties:
+      databases:
+        databases:
+        - name: scraper
+          tag: default
+        db_scheme: postgres
+        port: 5432
+        roles:
+        - name: postgres
+          password: postgres_pass
+          tag: default
+    release: postgres
+  - name: syslog_forwarder
+    release: syslog
+    properties:
+      syslog:
+        address: 
+        port: 1524
+  - name: sudo
+    release: sudo
+  - name: toolbelt
+    release: toolbelt
+  - name: toolbelt-quick
+    release: toolbelt
+  - name: toolbelt-mysql-client
+    release: toolbelt
+  - name: toolbelt-psql
+    release: toolbelt
+  - name: cron
+    release: cron
+    properties:
+      cron:
+        variables:
+          CURRENT_CELLS: "60"
+          CCDB_HOST: ""
+          CCDB_USER: "ccdbadmin"
+          CCDB_PASS: "((/cc_db_password))"
+          CCDB_NAME: "ccdb"
+        entries:
+        - script:
+            name: scrape.sh
+            contents: |
+              #!/bin/bash
+              echo "Started scrape at $(date)"
+              PSQL="/var/vcap/packages/toolbelt-psql/bin/psql"
+              MYSQL="/var/vcap/packages/toolbelt-mysql-client/bin/mysql" 
+              SOURCE_DB="$MYSQL --host=$CCDB_HOST --port=3306 --user=$CCDB_USER --password=$CCDB_PASS $CCDB_NAME -sN -e "
+              TARGET_DB="$PSQL -U vcap postgres -c "
+              
+              $TARGET_DB "CREATE TABLE IF NOT EXISTS cells (id BIGSERIAL PRIMARY KEY, current_cells INTEGER, needed_cells INTEGER, app_instances INTEGER, allocated_memory INTEGER, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP );"
+              
+              
+              NEEDED_CELLS=$($SOURCE_DB "SELECT  (ceiling( ( sum(memory * instances) )/120000 / 0.65) ) AS number_cells_needed_with_buffer_max_in_flight8 FROM processes WHERE state = 'STARTED'; ")
+              APP_INSTANCES=$($SOURCE_DB "SELECT sum(instances) as app_instances FROM processes WHERE state = 'STARTED'; ")
+              ALLOCATED_MEMORY=$($SOURCE_DB "SELECT sum(memory * instances) AS allocated_memory FROM processes WHERE state = 'STARTED'; ")
+              
+              $TARGET_DB "INSERT INTO cells (current_cells, needed_cells, app_instances, allocated_memory) VALUES ($CURRENT_CELLS, $NEEDED_CELLS, $APP_INSTANCES, $ALLOCATED_MEMORY);"
+
+          log: /var/vcap/sys/log/cron/data_load.log
+          minute: '*' 
+          hour: '*'   
+          day: '*'
+          month: '*'
+          wday: '*'
+          user: root
+        - script:
+            name: delete_rows.sh
+            contents: |
+              #!/bin/bash
+              echo "Started delete_rows at $(date)"
+              PSQL="/var/vcap/packages/toolbelt-psql/bin/psql"
+              TARGET_DB="$PSQL -U vcap postgres -c "
+              
+              $TARGET_DB "DELETE FROM cells WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '180 DAYS';"
+              
+
+          log: /var/vcap/sys/log/cron/delete_rows.log
+          minute: '26' 
+          hour: '*'   
+          day: '*'
+          month: '*'
+          wday: '*'
+          user: root
+        - script:
+            name: should_i_scale.sh
+            contents: |
+              #!/bin/bash
+              echo "Started should_i_scale at $(date)"
+              PSQL="/var/vcap/packages/toolbelt-psql/bin/psql"
+              TARGET_DB="$PSQL -U vcap postgres -t -c "
+              
+              MAX_ID=$($TARGET_DB "SELECT MAX(id) as max_id FROM cells; ")
+              PERCENT_DIFF=$($TARGET_DB "SELECT ( ( (needed_cells - current_cells) * 100 ) /current_cells ) AS d FROM cells WHERE id = $MAX_ID; ")
+              NEEDED_CELLS=$($TARGET_DB "SELECT needed_cells as d FROM cells WHERE id = $MAX_ID; ")
+              CURRENT_CELLS_SQL=$($TARGET_DB "SELECT current_cells as d FROM cells WHERE id = $MAX_ID; ")
+
+              echo "CF needs $NEEDED_CELLS cells and there are currently $CURRENT_CELLS_SQL cells, the percent difference is $PERCENT_DIFF %"
+
+              if [[ PERCENT_DIFF -gt 20 ]]
+              then
+                echo "WARNING: You need to add more cells!"
+              elif [[ PERCENT_DIFF -lt -25 ]]
+              then
+                echo "WARNING: You need to scale down the number of cells!"
+              else
+                echo "Your mix of cells is just right." 
+              fi
+
+
+          log: /var/vcap/sys/log/cron/should_i_scale_cells.log
+          minute: '*/15' 
+          hour: '*'   
+          day: '*'
+          month: '*'
+          wday: '*'
+          user: root
+  update:
+    max_in_flight: 4
+
+disk_pools:
+- disk_size: 20480
+  name: disks
+  cloud_properties:
+    type: gp2
+
+name: 
+
+releases:
+- name:    sudo
+  version: '4'
+  sha1:    48bb9657b81adb313a44917b73350cf08af06a8c
+  url:     https://github.com/cweibel/sudo-boshrelease/releases/download/v4/sudo-boshrelease.4.tar.gz
+
+- name:    cron
+  version: 1.3.1
+  url:     https://github.com/cloudfoundry-community/cron-boshrelease/releases/download/v1.3.1/cron-1.3.1.tgz
+  sha1:    cd10cadc655c9a90f1f1e0fea6b3c48ce4afc833
+
+- name:    postgres
+  sha1:    b062e32a5409ccd4e4161337c48705c793a58412
+  url:     https://bosh.io/d/github.com/cloudfoundry/postgres-release?v=17
+  version: '17'
+
+- name:    syslog
+  url:     https://bosh.io/d/github.com/cloudfoundry/syslog-release?v=11.6.0
+  version: '11.6.0'
+
+- name:    toolbelt
+  version: 3.4.2
+  url:     https://github.com/cloudfoundry-community/toolbelt-boshrelease/releases/download/v3.4.2/toolbelt-3.4.2.tgz
+  sha1:    2b4debac0ce6115f8b265ac21b196dda206e93ed
